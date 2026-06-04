@@ -9,130 +9,65 @@ Script Purpose :
 ================================================================================
 */
 
-USE ETL_PROJECT;
+IF OBJECT_id ('crm_cust_info' , 'U') IS NOT NULL
+   DROP TABLE crm_cust_info;
 GO
-CREATE OR ALTER PROCEDURE dbo.load_dbo AS
- BEGIN
-     DECLARE @start_time DATETIME, @end_time DATETIME,@batch_start_time DATETIME,@batch_end_time DATETIME;
-     BEGIN TRY
-         SET @batch_start_time = GETDATE();
-         PRINT '========================';
-         PRINT 'Loading a Bronze layer';
-         PRINT '========================';
-         PRINT '++++++++++++++++++++++++++++';
-         PRINT 'Loading CRM Tables';
-         PRINT '+++++++++++++++++++++++++++++';
-
-         SET @start_time = GETDATE();
-         PRINT 'Truncating Table : crm_cust_info';
-        TRUNCATE TABLE crm_cust_info;
-        PRINT 'Inserting  Table : crm_cust_info';
-        BULK INSERT crm_cust_info
-        FROM 'E:\Data_sets\cust_info.csv'
-        WITH (
-              FIRSTROW = 2,
-              FIELDTERMINATOR = ',',
-              TABLOCK
-        );
-        SET @end_time = GETDATE();
-        PRINT '>> load Duration :' + cast(DATEDIFF(SECOND,@start_time,@end_time) AS NVARCHAR)+ 'seconds';
-        PRINT '-------------------------------------';
-
-
-        SET @start_time = GETDATE();
-        PRINT 'Truncating Table : crm_prd_info';
-        TRUNCATE TABLE crm_prd_info;
-        PRINT 'Inserting Table : crm_prd_info';
-        BULK INSERT crm_prd_info
-        FROM 'E:\Data_sets\prd_info.csv'
-        with(
-              FIRSTROW = 2,
-              FIELDTERMINATOR =',',
-              TABLOCK
-        );
-        SET @end_time = GETDATE();
-        PRINT'>> load Duration :'+ CAST(DATEDIFF(SECOND,@start_time,@end_time) AS NVARCHAR)+'second';
-        print'---------------------------------------'
-
-        SET @start_time = GETDATE();
-        PRINT 'Truncating Table : crm_sales_details';
-        TRUNCATE TABLE crm_sales_details;
-        PRINT 'Inserting Table : crm_sales_details';
-        BULK INSERT crm_sales_details
-        FROM 'E:\Data_sets\sales_details.csv'
-        WITH(
-             FIRSTROW = 2,
-             FIELDTERMINATOR =',',
-             TABLOCK
-        );
-         SET @end_time = GETDATE();
-        PRINT '>> load Duration :' + cast(DATEDIFF(SECOND,@start_time,@end_time) AS NVARCHAR)+ 'seconds';
-        PRINT '-------------------------------------';
-
-         PRINT '++++++++++++++++++++++++++++';
-         PRINT 'Loading ERP Tables';
-         PRINT '+++++++++++++++++++++++++++++';
-
-        SET @start_time = GETDATE();
-        PRINT 'Truncating Table :  erp_cust_az12';
-        TRUNCATE TABLE erp_cust_az12;
-        PRINT 'Inserting Table : erp_cust_az12';
-        BULK INSERT erp_cust_az12
-        FROM 'E:\Data_sets\CUST_AZ12.csv'
-        WITH(
-             FIRSTROW =2,
-             FIELDTERMINATOR =',',
-             TABLOCK
-        );
-         SET @end_time = GETDATE();
-        PRINT '>> load Duration :' + cast(DATEDIFF(SECOND,@start_time,@end_time) AS NVARCHAR)+ 'seconds';
-        PRINT '-------------------------------------';
-
-        SET @start_time = GETDATE();
-         PRINT 'Truncating Table : erp_loc_a101';
-        TRUNCATE TABLE erp_loc_a101;
-        PRINT 'Inserting Table : erp_loc_a101';
-        BULK INSERT erp_loc_a101
-        FROM 'E:\Data_sets\LOC_A101.csv'
-        WITH(
-             FIRSTROW =2,
-             FIELDTERMINATOR =',',
-             TABLOCK
-        );
-         SET @end_time = GETDATE();
-        PRINT '>> load Duration :' + cast(DATEDIFF(SECOND,@start_time,@end_time) AS NVARCHAR)+ 'seconds';
-        PRINT '-------------------------------------';
-
-        SET @start_time = GETDATE();
-        PRINT 'Truncating Table :erp_px_cat_glv2';
-        TRUNCATE TABLE erp_px_cat_glv2;
-        PRINT 'Inserting Table : erp_px_cat_glv2';
-        BULK INSERT erp_px_cat_glv2
-        FROM 'E:\Data_sets\PX_CAT_G1V2.csv'
-        WITH(
-             FIRSTROW =2,
-             FIELDTERMINATOR =',',
-             TABLOCK
-        );
-         SET @end_time = GETDATE();
-        PRINT '>> load Duration :' + cast(DATEDIFF(SECOND,@start_time,@end_time) AS NVARCHAR)+ 'seconds';
-        PRINT '-------------------------------------';
-
-        SET @batch_end_time = GETDATE();
-        PRINT'========================================================='
-        PRINT'Loading Bronze Layer is Completed';
-        PRINT'Total Load Duration :' + CAST(DATEDIFF(SECOND,@batch_start_time,@batch_end_time) AS NVARCHAR) + 'seconds';
-    END TRY
-    BEGIN CATCH
-         PRINT '==========================';
-         PRINT 'ERORR OCCURED BRONZE LAYER';
-         PRINT 'Error Message : ' + ERROR_MESSAGE();
-         PRINT 'Error Number : ' + CAST(ERROR_NUMBER() AS NVARCHAR(10));
-         PRINT 'Error State : ' + CAST(ERROR_STATE() AS NVARCHAR(10));
-         PRINT 'Error Line : ' + CAST(ERROR_LINE() AS NVARCHAR(10));
-         PRINT '==================================================';
-         THROW;  -- Added: sends error to caller so job fails properly
-    END CATCH
- END
-   GO
-     EXEC dbo.load_dbo
+CREATE TABLE crm_cust_info(
+	cst_id INT,
+	cst_key NVARCHAR(50),
+	cst_firstname NVARCHAR(50),
+	cst_lastname NVARCHAR(50),
+	cst_material_status NVARCHAR(50),
+	cst_gndr NVARCHAR(50),
+	cst_create_date DATE
+);
+GO
+IF OBJECT_id ('crm_prd_info' , 'U') IS NOT NULL
+   DROP TABLE crm_prd_info;
+CREATE TABLE crm_prd_info(
+	prd_id      INT,
+	prd_key     NVARCHAR(50),
+	prd_nm      NVARCHAR(50),
+	prd_cost    INT,
+	prd_line    NVARCHAR(50),
+	prd_start_dt DATETIME,
+	prd_end_dt   DATETIME
+);
+GO
+IF OBJECT_id ('crm_sales_details' , 'U') IS NOT NULL
+   DROP TABLE crm_sales_details;
+CREATE TABLE crm_sales_details (
+   sls_ord_num NVARCHAR(50),
+   sls_prd_key NVARCHAR(50),
+   sls_cust_id INT,
+   sls_order_dt INT,
+   sls_ship_dt INT,
+   sls_due_dt  INT,
+   sls_sales  INT,
+   sls_quantity INT,
+   sls_price INT
+);
+GO
+IF OBJECT_id ('erp_loc_a101' , 'U') IS NOT NULL
+   DROP TABLE erp_loc_a101;
+CREATE TABLE erp_loc_a101 (
+    cid NVARCHAR(50),
+	cntry NVARCHAR(50)
+);
+GO
+IF OBJECT_id ('erp_cust_az12' , 'U') IS NOT NULL
+   DROP TABLE erp_cust_az12;
+CREATE TABLE erp_cust_az12 (
+    cid NVARCHAR(50),
+	bdate DATE,
+	gen NVARCHAR(50)
+);
+GO
+IF OBJECT_id ('erp_px_cat_glv2' , 'U') IS NOT NULL
+   DROP TABLE erp_px_cat_glv2;
+CREATE TABLE erp_px_cat_glv2 (
+    id  NVARCHAR(50),
+	cat NVARCHAR(50),
+	subcat NVARCHAR(50),
+	maintenance NVARCHAR(50)
+);
