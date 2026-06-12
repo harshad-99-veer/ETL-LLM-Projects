@@ -1,1 +1,92 @@
 
+-- data transformation scipt
+
+IF OBJECT_ID('silver.crm_prd_info', 'U') IS NOT NULL 
+   DROP TABLE silver.crm_prd_info;
+GO
+
+CREATE TABLE silver.crm_prd_info (
+     prd_id         INT,
+     cat_id         NVARCHAR(50),
+     prd_key        NVARCHAR(50),
+     prd_nm         NVARCHAR(100),
+     prd_cost       INT,
+     prd_line       VARCHAR(100),
+     prd_start_dt   DATE,
+     prd_end_dt     DATE,
+     dwh_create_date DATETIME DEFAULT GETDATE(),
+     dwh_hash_key   VARBINARY(32),
+     dwh_start_date DATETIME2 DEFAULT GETDATE(),
+     dwh_end_date   DATETIME2 DEFAULT '9999-12-31',
+     dwh_is_current BIT DEFAULT 1,
+     CONSTRAINT PK_silver_crm_prd_info PRIMARY KEY (prd_id, dwh_start_date)
+);
+GO
+PRINT('Truncating table silver.crm_prd_info')
+TRUNCATE TABLE silver.crm_prd_info;
+PRINT('insert the table silver.crm_prd_info')
+INSERT INTO silver.crm_prd_info (
+     prd_id,
+     cat_id,
+     prd_key,
+     prd_nm,
+     prd_cost,
+     prd_line,
+     prd_start_dt,
+     prd_end_dt,
+     dwh_create_date,
+     dwh_hash_key,
+     dwh_start_date,
+     dwh_end_date,
+     dwh_is_current
+)
+SELECT
+   prd_id,
+   
+   -- Fix 1: cat_id = first 5 chars of prd_key, replace '-' with '_'
+   REPLACE(SUBSTRING(prd_key, 1, 5), '-', '_') AS cat_id,
+   
+   -- Fix 2: prd_key = remaining chars after position 7
+   TRIM(SUBSTRING(prd_key, 7, LEN(prd_key))) AS prd_key,
+   
+   TRIM(prd_nm) AS prd_nm,
+   
+   -- Fix 3: Data cleaning for cost. Text/NULL → 0
+   ISNULL(TRY_CAST(prd_cost AS INT), 0) AS prd_cost,
+   
+   -- Fix 4: Standardize product line
+   CASE UPPER(TRIM(prd_line))
+        WHEN 'M' THEN 'Mountain'
+        WHEN 'R' THEN 'Road'
+        WHEN 'S' THEN 'Other Sales'
+        WHEN 'T' THEN 'Touring'
+        ELSE 'Unknown'
+   END AS prd_line,
+   
+   -- Fix 5: Bronze has INT YYYYMMDD. Convert to DATE
+   TRY_CONVERT(DATE, CAST(prd_start_dt AS VARCHAR(8)), 112) AS prd_start_dt,
+   
+   -- Fix 6: End date = next start date - 1 day
+   DATEADD(DAY, -1, LEAD(TRY_CONVERT(DATE, CAST(prd_start_dt AS VARCHAR(8)), 112)) 
+           OVER (PARTITION BY TRIM(SUBSTRING(prd_key, 7, LEN(prd_key))) 
+                 ORDER BY TRY_CONVERT(DATE, CAST(prd_start_dt AS VARCHAR(8)), 112))) AS prd_end_dt,
+   
+   GETDATE() AS dwh_create_date,
+   
+   HASHBYTES('MD5', CONCAT(
+       prd_id, '|',
+       REPLACE(SUBSTRING(prd_key, 1, 5), '-', '_'), '|',
+       TRIM(SUBSTRING(prd_key, 7, LEN(prd_key))), '|',
+       TRIM(prd_nm), '|',
+       ISNULL(TRY_CAST(prd_cost AS INT), 0)
+   )) AS dwh_hash_key,
+   
+   GETDATE() AS dwh_start_date,
+   CAST('9999-12-31' AS DATETIME2) AS dwh_end_date,
+   1 AS dwh_is_current
+FROM dbo.crm_prd_info -- Fixed: was dbo
+WHERE prd_id IS NOT NULL;
+GO
+
+
+SELECT * FROM silver.crm_prd_info
