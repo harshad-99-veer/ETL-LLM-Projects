@@ -1,0 +1,106 @@
+/********************************************************************
+* DQ CHECKS: silver.erp_cust_az12
+* CATEGORIES: Completeness, Uniqueness, Validity, Consistency, FK
+********************************************************************/
+
+-- Temp table to store DQ results
+IF OBJECT_ID('tempdb..#DQ_Results') IS NOT NULL DROP TABLE #DQ_Results;
+CREATE TABLE #DQ_Results (
+    check_category VARCHAR(20),
+    check_name VARCHAR(100),
+    failed_rows INT,
+    sample_bad_value VARCHAR(200)
+);
+
+-- 1. COMPLETENESS CHECKS - NULL values in critical columns
+INSERT INTO #DQ_Results
+SELECT 'Completeness', 'PK cid is NULL', COUNT(*), NULL 
+FROM silver.erp_cust_az12 WHERE cid IS NULL
+UNION ALL
+SELECT 'Completeness', 'Gender is NULL', COUNT(*), NULL 
+FROM silver.erp_cust_az12 WHERE gen IS NULL;
+
+-- 2. UNIQUENESS CHECKS - PK duplicates
+INSERT INTO #DQ_Results
+SELECT 'Uniqueness', 'Duplicate CID', COUNT(*), TOP1.cid
+FROM (
+    SELECT cid, COUNT(*) as cnt 
+    FROM silver.erp_cust_az12 
+    GROUP BY cid HAVING COUNT(*) > 1
+) dup
+CROSS APPLY (SELECT TOP 1 cid FROM silver.erp_cust_az12 WHERE cid = dup.cid) TOP1;
+
+-- 3. VALIDITY CHECKS - Business rules
+INSERT INTO #DQ_Results
+SELECT 'Validity', 'Future Birth Date', COUNT(*), CONVERT(VARCHAR, MAX(bdate), 120)
+FROM silver.erp_cust_az12 WHERE bdate > CAST(GETDATE() AS DATE)
+UNION ALL
+SELECT 'Validity', 'Invalid Gender Value', COUNT(*), MAX(gen)
+FROM silver.erp_cust_az12 WHERE gen NOT IN ('Male','Female','n/a')
+UNION ALL
+SELECT 'Validity', 'Unrealistic Age > 120 years', COUNT(*), CONVERT(VARCHAR, MIN(bdate), 120)
+FROM silver.erp_cust_az12 WHERE bdate < DATEADD(YEAR, -120, GETDATE())
+UNION ALL
+SELECT 'Validity', 'CID Length > 20', COUNT(*), MAX(cid)
+FROM silver.erp_cust_az12 WHERE LEN(cid) > 20;
+
+-- 4. CONSISTENCY CHECKS - Format rules
+INSERT INTO #DQ_Results
+SELECT 'Consistency', 'CID has leading/trailing spaces', COUNT(*), MAX(cid)
+FROM silver.erp_cust_az12 WHERE cid <> LTRIM(RTRIM(cid))
+UNION ALL
+SELECT 'Consistency', 'Gender has wrong case', COUNT(*), MAX(gen)
+FROM silver.erp_cust_az12 WHERE gen IN ('male','female','MALE','FEMALE');
+
+-- 5. REFERENTIAL INTEGRITY - FK to CRM master
+INSERT INTO #DQ_Results
+SELECT 'Referential', 'CID not in crm_cust_info', COUNT(*), MAX(s.cid)
+FROM silver.erp_cust_az12 s
+LEFT JOIN silver.crm_cust_info c ON s.cid = c.cst_key
+WHERE c.cst_key IS NULL;
+
+-- 6. FINAL REPORT
+SELECT 
+    check_category,
+    check_name,
+    failed_rows,
+    CASE WHEN failed_rows = 0 THEN 'PASS' ELSE 'FAIL' END AS status,
+    sample_bad_value
+FROM #DQ_Results
+ORDER BY 
+    CASE status WHEN 'FAIL' THEN 1 ELSE 2 END,
+    check_category;
+
+-- 7. DETAILED SAMPLE OF FAILED ROWS - Top 10 per failed check
+PRINT '--- SAMPLE BAD ROWS ---'
+
+-- Future DOB samples
+SELECT TOP 10 'Future DOB' AS issue, cid, bdate, gen 
+FROM silver.erp_cust_az12 
+WHERE bdate > GETDATE();
+
+-- Invalid Gender samples  
+SELECT TOP 10 'Invalid Gender' AS issue, cid, bdate, gen 
+FROM silver.erp_cust_az12 
+WHERE gen NOT IN ('Male','Female','n/a');
+
+-- FK Missing samples
+SELECT TOP 10 'FK Missing' AS issue, s.cid, s.bdate, s.gen 
+FROM silver.erp_cust_az12 s
+LEFT JOIN silver.crm_cust_info c ON s.cid = c.cst_key
+WHERE c.cst_key IS NULL;
+
+DROP TABLE #DQ_Results;
+GO
+
+
+SELECT 
+    'Total Rows' AS metric, COUNT(*) AS value FROM silver.erp_cust_az12
+UNION ALL
+SELECT 'NULL CID', COUNT(*) FROM silver.erp_cust_az12 WHERE cid IS NULL
+UNION ALL  
+SELECT 'Duplicate CID', COUNT(*) - COUNT(DISTINCT cid) FROM silver.erp_cust_az12
+UNION ALL
+SELECT 'Future BDate', COUNT(*) FROM silver.erp_cust_az12 WHERE bdate > GETDATE()
+UNION ALL
+SELECT 'Bad Gender', COUNT(*) FROM silver.erp_cust_az12 WHERE gen NOT IN ('Male','Female','n/a');
