@@ -1,0 +1,467 @@
+-- This code create for the store procedure for silver layer all six tables code included given below 
+
+USE ETL_PROJECT;
+GO
+
+CREATE OR ALTER PROCEDURE silver.load_silver
+AS
+BEGIN
+    SET NOCOUNT ON;
+    PRINT 'Starting Silver Layer ETL - All 6 Tables';
+
+    -- =================================================================
+    -- TABLE 1: silver.crm_cust_info
+    -- PURPOSE: Clean CRM customer master data
+    -- SCD TYPE: Type 1 - overwrite old values when data changes
+    -- =================================================================
+    
+    -- STEP 1: Drop table if exists. Ensures clean reload on every run.
+    IF OBJECT_ID('silver.crm_cust_info', 'U') IS NOT NULL
+        DROP TABLE silver.crm_cust_info;
+
+    -- STEP 2: Create target table with audit columns for data lineage
+    CREATE TABLE silver.crm_cust_info
+    (
+        cst_id INT PRIMARY KEY,
+        cst_key NVARCHAR(50) NOT NULL,
+        cst_firstname NVARCHAR(50),
+        cst_lastname NVARCHAR(50),
+        cst_material_status VARCHAR(10) NOT NULL DEFAULT 'n/a',
+        cst_gndr VARCHAR(10) NOT NULL DEFAULT 'n/a',
+        cst_create_date DATE,
+        dwh_load_date DATETIME NOT NULL DEFAULT GETDATE(),
+        dwh_source VARCHAR(50) NOT NULL DEFAULT 'crm_cust_info',
+        dwh_hash_key VARBINARY(32) NULL
+    );
+
+    -- STEP 3: Build CTE to clean and deduplicate source data
+    -- 3A: LTRIM/RTRIM removes leading and trailing spaces. Used instead of TRIM for SQL 2012 compatibility
+    -- 3B: Standardize marital status. Map S->Single, M->Married, everything else->n/a
+    -- 3C: Standardize gender. Map F->Female, M->Male, everything else->n/a
+    -- 3D: Create SHA2_256 hash of all business columns to detect changes on rerun
+    -- 3E: ROW_NUMBER with PARTITION BY cst_id keeps only latest record per customer based on create date
+    ;WITH SourceData AS
+    (
+        SELECT 
+            cst_id,
+            LTRIM(RTRIM(cst_key)) AS cst_key,
+            LTRIM(RTRIM(cst_firstname)) AS cst_firstname,
+            LTRIM(RTRIM(cst_lastname)) AS cst_lastname,
+            
+            CASE UPPER(LTRIM(RTRIM(cst_material_status)))
+                WHEN 'S' THEN 'Single'
+                WHEN 'M' THEN 'Married'
+                ELSE 'n/a'
+            END AS cst_material_status,
+            
+            CASE UPPER(LTRIM(RTRIM(cst_gndr)))
+                WHEN 'F' THEN 'Female'
+                WHEN 'M' THEN 'Male'
+                ELSE 'n/a'
+            END AS cst_gndr,
+            
+            cst_create_date,
+            
+            HASHBYTES('SHA2_256', CONCAT(
+                cst_id, '|',
+                LTRIM(RTRIM(cst_key)), '|',
+                LTRIM(RTRIM(cst_firstname)), '|',
+                LTRIM(RTRIM(cst_lastname)), '|',
+                LTRIM(RTRIM(cst_material_status)), '|',
+                LTRIM(RTRIM(cst_gndr))
+            )) AS hash_key,
+            
+            ROW_NUMBER() OVER (PARTITION BY cst_id ORDER BY cst_create_date DESC) AS rn
+        FROM dbo.crm_cust_info
+        WHERE cst_id IS NOT NULL
+    )
+    
+    -- STEP 4: MERGE statement for rerun safety
+    -- 4A: When customer exists and hash changed, update all columns + audit fields
+    -- 4B: When customer does not exist, insert new record
+    MERGE silver.crm_cust_info AS Target
+    USING (SELECT * FROM SourceData WHERE rn = 1) AS Source
+    ON Target.cst_id = Source.cst_id
+    WHEN MATCHED AND Target.dwh_hash_key <> Source.hash_key THEN
+        UPDATE SET 
+            cst_key = Source.cst_key,
+            cst_firstname = Source.cst_firstname,
+            cst_lastname = Source.cst_lastname,
+            cst_material_status = Source.cst_material_status,
+            cst_gndr = Source.cst_gndr,
+            cst_create_date = Source.cst_create_date,
+            dwh_load_date = GETDATE(),
+            dwh_hash_key = Source.hash_key
+    WHEN NOT MATCHED BY TARGET THEN
+        INSERT (cst_id, cst_key, cst_firstname, cst_lastname, cst_material_status, cst_gndr, 
+                cst_create_date, dwh_load_date, dwh_source, dwh_hash_key)
+        VALUES (Source.cst_id, Source.cst_key, Source.cst_firstname, Source.cst_lastname, 
+                Source.cst_material_status, Source.cst_gndr, Source.cst_create_date, 
+                GETDATE(), 'crm_cust_info', Source.hash_key);
+
+    -- =================================================================
+    -- TABLE 2: silver.crm_prd_info
+    -- PURPOSE: Clean CRM product data  
+    -- SCD TYPE: Type 2 - maintain history with start_date and end_date
+    -- =================================================================
+    
+    -- STEP 1: Drop and recreate table with composite PK for SCD2 history
+    IF OBJECT_ID('silver.crm_prd_info', 'U') IS NOT NULL
+        DROP TABLE silver.crm_prd_info;
+
+    CREATE TABLE silver.crm_prd_info
+    (
+        prd_id INT NOT NULL,
+        cat_id NVARCHAR(50),
+        prd_key NVARCHAR(50),
+        prd_nm NVARCHAR(100),
+        prd_cost INT,
+        prd_line VARCHAR(50),
+        prd_start_dt DATE,
+        prd_end_dt DATE,
+        dwh_create_date DATETIME DEFAULT GETDATE(),
+        dwh_hash_key VARBINARY(32),
+        dwh_start_date DATETIME2 NOT NULL DEFAULT GETDATE(),
+        dwh_end_date DATETIME2 NOT NULL DEFAULT '9999-12-31',
+        dwh_is_current BIT NOT NULL DEFAULT 1,
+        CONSTRAINT PK_silver_crm_prd_info PRIMARY KEY (prd_id, dwh_start_date)
+    );
+
+    -- STEP 2: First CTE to transform bronze product data
+    -- 2A: Extract cat_id = first 5 characters of prd_key, replace dash with underscore
+    -- 2B: Extract prd_key = substring starting from position 7 to end
+    -- 2C: LTRIM/RTRIM removes spaces from product name
+    -- 2D: TRY_CAST converts cost to INT, ISNULL replaces NULL or invalid text with 0
+    -- 2E: Standardize product line codes to full names for reporting
+    -- 2F: TRY_CONVERT changes YYYYMMDD integer to proper DATE data type using style 112
+    -- 2G: Create hash for change detection
+    ;WITH CleanedData AS
+    (
+        SELECT 
+            prd_id,
+            REPLACE(SUBSTRING(LTRIM(RTRIM(prd_key)), 1, 5), '-', '_') AS cat_id,
+            LTRIM(RTRIM(SUBSTRING(prd_key, 7, LEN(prd_key)))) AS prd_key,
+            LTRIM(RTRIM(prd_nm)) AS prd_nm,
+            ISNULL(TRY_CAST(prd_cost AS INT), 0) AS prd_cost,
+            
+            CASE UPPER(LTRIM(RTRIM(prd_line)))
+                WHEN 'M' THEN 'Mountain'
+                WHEN 'R' THEN 'Road'
+                WHEN 'S' THEN 'Sport'
+                WHEN 'T' THEN 'Touring'
+                ELSE 'Unknown'
+            END AS prd_line,
+            
+            TRY_CONVERT(DATE, CAST(prd_start_dt AS VARCHAR(8)), 112) AS prd_start_dt,
+            
+            HASHBYTES('SHA2_256', CONCAT(
+                prd_id, '|',
+                REPLACE(SUBSTRING(LTRIM(RTRIM(prd_key)), 1, 5), '-', '_'), '|',
+                LTRIM(RTRIM(SUBSTRING(prd_key, 7, LEN(prd_key)))), '|',
+                LTRIM(RTRIM(prd_nm)), '|',
+                ISNULL(TRY_CAST(prd_cost AS INT), 0), '|',
+                LTRIM(RTRIM(prd_line))
+            )) AS hash_key
+        FROM dbo.crm_prd_info
+        WHERE prd_id IS NOT NULL
+    ),
+    
+    -- STEP 3: Second CTE to calculate end dates for SCD2
+    -- 3A: LEAD window function gets next start date for same product key
+    -- 3B: DATEADD subtracts 1 day to make end date = day before next version starts
+    WithEndDate AS
+    (
+        SELECT *,
+            DATEADD(DAY, -1, LEAD(prd_start_dt) OVER (
+                PARTITION BY prd_key ORDER BY prd_start_dt
+            )) AS prd_end_dt
+        FROM CleanedData
+    )
+    
+    -- STEP 4: Insert all product versions with SCD2 audit fields
+    -- 4A: dwh_start_date = current load time
+    -- 4B: dwh_end_date = '9999-12-31' for current version
+    -- 4C: dwh_is_current = 1 for active version
+    INSERT INTO silver.crm_prd_info
+        (prd_id, cat_id, prd_key, prd_nm, prd_cost, prd_line, prd_start_dt, prd_end_dt,
+         dwh_create_date, dwh_hash_key, dwh_start_date, dwh_end_date, dwh_is_current)
+    SELECT 
+        prd_id, cat_id, prd_key, prd_nm, prd_cost, prd_line, prd_start_dt, prd_end_dt,
+        GETDATE(), hash_key, GETDATE(), '9999-12-31', 1
+    FROM WithEndDate;
+
+    -- =================================================================
+    -- TABLE 3: silver.crm_sales_details
+    -- PURPOSE: Clean CRM sales transaction data
+    -- =================================================================
+    
+    -- STEP 1: Drop and recreate table
+    IF OBJECT_ID('silver.crm_sales_details', 'U') IS NOT NULL
+        DROP TABLE silver.crm_sales_details;
+
+    CREATE TABLE silver.crm_sales_details
+    (
+        sls_ord_num NVARCHAR(50),
+        sls_prd_key NVARCHAR(50),
+        sls_cust_id INT,
+        sls_order_dt DATE,
+        sls_ship_dt DATE,
+        sls_due_dt DATE,
+        sls_sales INT,
+        sls_quantity INT,
+        sls_price INT,
+        dwh_load_date DATETIME NOT NULL DEFAULT GETDATE(),
+        dwh_source VARCHAR(50) NOT NULL DEFAULT 'crm_sales_details'
+    );
+
+    CREATE NONCLUSTERED INDEX IX_silver_crm_sales_details_ord 
+        ON silver.crm_sales_details(sls_ord_num);
+
+    -- STEP 2: Insert with data quality rules
+    -- 2A: LTRIM/RTRIM cleans order number and product key
+    -- 2B: Date validation. If date = 0 or length <> 8, set to NULL. Else convert YYYYMMDD to DATE
+    -- 2C: Sales calculation. If sales is NULL, <=0, or not equal to qty*price, recalculate
+    -- 2D: Quantity must be positive. ABS converts negative returns to positive
+    -- 2E: Price calculation. If price is NULL or <=0, divide sales by quantity. NULLIF prevents divide by zero
+    INSERT INTO silver.crm_sales_details
+        (sls_ord_num, sls_prd_key, sls_cust_id, sls_order_dt, sls_ship_dt, sls_due_dt,
+         sls_sales, sls_quantity, sls_price, dwh_load_date, dwh_source)
+    SELECT 
+        LTRIM(RTRIM(sls_ord_num)),
+        LTRIM(RTRIM(sls_prd_key)),
+        sls_cust_id,
+        
+        CASE WHEN sls_order_dt = 0 OR LEN(CAST(sls_order_dt AS VARCHAR)) <> 8 
+             THEN NULL ELSE TRY_CONVERT(DATE, CAST(sls_order_dt AS VARCHAR(8)), 112) END,
+        
+        CASE WHEN sls_ship_dt = 0 OR LEN(CAST(sls_ship_dt AS VARCHAR)) <> 8 
+             THEN NULL ELSE TRY_CONVERT(DATE, CAST(sls_ship_dt AS VARCHAR(8)), 112) END,
+        
+        CASE WHEN sls_due_dt = 0 OR LEN(CAST(sls_due_dt AS VARCHAR)) <> 8 
+             THEN NULL ELSE TRY_CONVERT(DATE, CAST(sls_due_dt AS VARCHAR(8)), 112) END,
+        
+        CASE WHEN sls_sales IS NULL OR sls_sales <= 0 OR sls_sales <> sls_quantity * ABS(sls_price)
+             THEN sls_quantity * ABS(sls_price)
+             ELSE sls_sales END,
+        
+        ABS(sls_quantity),
+        
+        CASE WHEN sls_price IS NULL OR sls_price <= 0
+             THEN sls_sales / NULLIF(sls_quantity, 0)
+             ELSE ABS(sls_price) END,
+        
+        GETDATE(),
+        'crm_sales_details'
+    FROM dbo.crm_sales_details;
+
+    -- =================================================================
+    -- TABLE 4: silver.erp_cust_az12
+    -- PURPOSE: Clean ERP customer demographics
+    -- FK: References silver.crm_cust_info.cst_key
+    -- =================================================================
+    
+    -- STEP 1: Drop and recreate table
+    IF OBJECT_ID('silver.erp_cust_az12', 'U') IS NOT NULL
+        DROP TABLE silver.erp_cust_az12;
+
+    CREATE TABLE silver.erp_cust_az12
+    (
+        cid VARCHAR(20) PRIMARY KEY,
+        bdate DATE NULL,
+        gen VARCHAR(10) NOT NULL DEFAULT 'n/a',
+        dwh_load_date DATETIME NOT NULL DEFAULT GETDATE(),
+        dwh_source VARCHAR(50) NOT NULL DEFAULT 'erp_cust_az12',
+        dwh_hash_key VARBINARY(32) NULL
+    );
+
+    CREATE NONCLUSTERED INDEX IX_silver_erp_cust_az12_cid ON silver.erp_cust_az12(cid);
+
+    -- STEP 2: CTE to clean ERP customer data
+    -- 2A: Remove 'NAS' prefix from customer ID using STUFF function
+    -- 2B: Future birth dates are invalid. Set any date > today to NULL
+    -- 2C: Standardize gender. Accept F/FEMALE and M/MALE, else n/a
+    -- 2D: Create hash for change detection
+    -- 2E: Deduplicate. Keep latest birth date per customer. NULL dates sorted last
+    ;WITH CleanedData AS
+    (
+        SELECT 
+            CASE WHEN cid LIKE 'NAS%' THEN STUFF(cid, 1, 3, '') ELSE cid END AS clean_cid,
+            CASE WHEN bdate > CAST(GETDATE() AS DATE) THEN NULL ELSE CAST(bdate AS DATE) END AS clean_bdate,
+            
+            CASE UPPER(LTRIM(RTRIM(gen)))
+                WHEN 'F' THEN 'Female'
+                WHEN 'FEMALE' THEN 'Female'
+                WHEN 'M' THEN 'Male'
+                WHEN 'MALE' THEN 'Male'
+                ELSE 'n/a'
+            END AS clean_gen,
+            
+            HASHBYTES('SHA2_256', CONCAT(
+                CASE WHEN cid LIKE 'NAS%' THEN STUFF(cid, 1, 3, '') ELSE cid END, '|',
+                ISNULL(CONVERT(VARCHAR(10), bdate, 120), 'NULL'), '|',
+                LTRIM(RTRIM(gen))
+            )) AS hash_key,
+            
+            ROW_NUMBER() OVER (
+                PARTITION BY CASE WHEN cid LIKE 'NAS%' THEN STUFF(cid, 1, 3, '') ELSE cid END
+                ORDER BY CASE WHEN bdate IS NULL THEN 1 ELSE 0 END, bdate DESC
+            ) AS rn
+        FROM dbo.erp_cust_az12
+        WHERE cid IS NOT NULL
+    )
+    
+    -- STEP 3: MERGE with foreign key validation
+    -- 3A: Only load customers that exist in CRM master table
+    -- 3B: Update if data changed, insert if new
+    MERGE silver.erp_cust_az12 AS Target
+    USING (
+        SELECT clean_cid, clean_bdate, clean_gen, hash_key 
+        FROM CleanedData 
+        WHERE rn = 1 
+        AND clean_cid IN (SELECT DISTINCT cst_key FROM silver.crm_cust_info WHERE cst_key IS NOT NULL)
+    ) AS Source
+    ON Target.cid = Source.clean_cid
+    WHEN MATCHED AND Target.dwh_hash_key <> Source.hash_key THEN
+        UPDATE SET bdate = Source.clean_bdate, gen = Source.clean_gen, 
+                   dwh_load_date = GETDATE(), dwh_hash_key = Source.hash_key
+    WHEN NOT MATCHED BY TARGET THEN
+        INSERT (cid, bdate, gen, dwh_load_date, dwh_source, dwh_hash_key)
+        VALUES (Source.clean_cid, Source.clean_bdate, Source.clean_gen, GETDATE(), 'erp_cust_az12', Source.hash_key);
+
+    -- =================================================================
+    -- TABLE 5: silver.erp_loc_a101
+    -- PURPOSE: Clean ERP location data
+    -- FK: References silver.erp_cust_az12.cid
+    -- =================================================================
+    
+    -- STEP 1: Drop and recreate table
+    IF OBJECT_ID('silver.erp_loc_a101', 'U') IS NOT NULL
+        DROP TABLE silver.erp_loc_a101;
+
+    CREATE TABLE silver.erp_loc_a101
+    (
+        cid VARCHAR(20) PRIMARY KEY,
+        cntry VARCHAR(50) NOT NULL DEFAULT 'n/a',
+        dwh_load_date DATETIME NOT NULL DEFAULT GETDATE(),
+        dwh_source VARCHAR(50) NOT NULL DEFAULT 'erp_loc_a101',
+        dwh_hash_key VARBINARY(32) NULL
+    );
+
+    CREATE NONCLUSTERED INDEX IX_silver_erp_loc_a101_cid ON silver.erp_loc_a101(cid);
+
+    -- STEP 2: CTE to clean location data
+    -- 2A: REPLACE removes all dashes from customer ID
+    -- 2B: Standardize country codes. DE->Germany, US/USA->United States, blank->n/a
+    -- 2C: Create hash for change detection
+    -- 2D: Deduplicate by cleaned CID
+    ;WITH CleanedData AS
+    (
+        SELECT 
+            REPLACE(cid, '-', '') AS clean_cid,
+            
+            CASE LTRIM(RTRIM(cntry))
+                WHEN 'DE' THEN 'Germany'
+                WHEN 'US' THEN 'United States'
+                WHEN 'USA' THEN 'United States'
+                WHEN '' THEN 'n/a'
+                ELSE LTRIM(RTRIM(cntry))
+            END AS clean_cntry,
+            
+            HASHBYTES('SHA2_256', CONCAT(
+                REPLACE(cid, '-', ''), '|', LTRIM(RTRIM(ISNULL(cntry, 'n/a')))
+            )) AS hash_key,
+            
+            ROW_NUMBER() OVER (PARTITION BY REPLACE(cid, '-', '') ORDER BY REPLACE(cid, '-', '')) AS rn
+        FROM dbo.erp_loc_a101
+        WHERE cid IS NOT NULL
+    )
+    
+    -- STEP 3: MERGE with foreign key validation
+    -- 3A: Only load locations for customers that exist in ERP customer table
+    MERGE silver.erp_loc_a101 AS Target
+    USING (
+        SELECT clean_cid, clean_cntry, hash_key 
+        FROM CleanedData 
+        WHERE rn = 1 
+        AND clean_cid IN (SELECT cid FROM silver.erp_cust_az12 WHERE cid IS NOT NULL)
+    ) AS Source
+    ON Target.cid = Source.clean_cid
+    WHEN MATCHED AND Target.dwh_hash_key <> Source.hash_key THEN
+        UPDATE SET cntry = Source.clean_cntry, dwh_load_date = GETDATE(), dwh_hash_key = Source.hash_key
+    WHEN NOT MATCHED BY TARGET THEN
+        INSERT (cid, cntry, dwh_load_date, dwh_source, dwh_hash_key)
+        VALUES (Source.clean_cid, Source.clean_cntry, GETDATE(), 'erp_loc_a101', Source.hash_key);
+
+    -- =================================================================
+    -- TABLE 6: silver.erp_px_cat_g1v2
+    -- PURPOSE: Clean ERP product category reference data
+    -- =================================================================
+    
+    -- STEP 1: Drop and recreate table
+    IF OBJECT_ID('silver.erp_px_cat_g1v2', 'U') IS NOT NULL
+        DROP TABLE silver.erp_px_cat_g1v2;
+
+    CREATE TABLE silver.erp_px_cat_g1v2
+    (
+        id VARCHAR(10) PRIMARY KEY,
+        cat VARCHAR(50) NOT NULL,
+        subcat VARCHAR(50) NOT NULL,
+        maintenance VARCHAR(3) NOT NULL DEFAULT 'No',
+        dwh_load_date DATETIME NOT NULL DEFAULT GETDATE(),
+        dwh_source VARCHAR(50) NOT NULL DEFAULT 'erp_px_cat_g1v2',
+        dwh_hash_key VARBINARY(32) NULL
+    );
+
+    CREATE NONCLUSTERED INDEX IX_silver_erp_px_cat_g1v2_id ON silver.erp_px_cat_g1v2(id);
+
+    -- STEP 2: CTE to clean category data
+    -- 2A: LTRIM/RTRIM removes spaces from ID, category, subcategory
+    -- 2B: Proper case conversion. First letter uppercase, rest lowercase
+    -- 2C: Standardize maintenance flag. Y/YES/1->Yes, N/NO/0/blank->No
+    -- 2D: Create hash for change detection
+    -- 2E: Deduplicate by cleaned ID
+    ;WITH CleanedData AS
+    (
+        SELECT 
+            LTRIM(RTRIM(id)) AS clean_id,
+            UPPER(LEFT(LTRIM(RTRIM(cat)), 1)) + LOWER(SUBSTRING(LTRIM(RTRIM(cat)), 2, 50)) AS clean_cat,
+            UPPER(LEFT(LTRIM(RTRIM(subcat)), 1)) + LOWER(SUBSTRING(LTRIM(RTRIM(subcat)), 2, 50)) AS clean_subcat,
+            
+            CASE UPPER(LTRIM(RTRIM(maintenance)))
+                WHEN 'Y' THEN 'Yes'
+                WHEN 'YES' THEN 'Yes'
+                WHEN '1' THEN 'Yes'
+                WHEN 'N' THEN 'No'
+                WHEN 'NO' THEN 'No'
+                WHEN '0' THEN 'No'
+                WHEN '' THEN 'No'
+                WHEN NULL THEN 'No'
+                ELSE 'No'
+            END AS clean_maintenance,
+            
+            HASHBYTES('SHA2_256', CONCAT(
+                LTRIM(RTRIM(id)), '|',
+                LTRIM(RTRIM(ISNULL(cat, ''))), '|',
+                LTRIM(RTRIM(ISNULL(subcat, ''))), '|',
+                LTRIM(RTRIM(ISNULL(maintenance, 'No')))
+            )) AS hash_key,
+            
+            ROW_NUMBER() OVER (PARTITION BY LTRIM(RTRIM(id)) ORDER BY LTRIM(RTRIM(id))) AS rn
+        FROM dbo.erp_px_cat_g1v2
+        WHERE id IS NOT NULL
+    )
+    
+    -- STEP 3: MERGE for rerun safety
+    MERGE silver.erp_px_cat_g1v2 AS Target
+    USING (SELECT clean_id, clean_cat, clean_subcat, clean_maintenance, hash_key FROM CleanedData WHERE rn = 1) AS Source
+    ON Target.id = Source.clean_id
+    WHEN MATCHED AND Target.dwh_hash_key <> Source.hash_key THEN
+        UPDATE SET cat = Source.clean_cat, subcat = Source.clean_subcat, maintenance = Source.clean_maintenance, 
+                   dwh_load_date = GETDATE(), dwh_hash_key = Source.hash_key
+    WHEN NOT MATCHED BY TARGET THEN
+        INSERT (id, cat, subcat, maintenance, dwh_load_date, dwh_source, dwh_hash_key)
+        VALUES (Source.clean_id, Source.clean_cat, Source.clean_subcat, Source.clean_maintenance, GETDATE(), 'erp_px_cat_g1v2', Source.hash_key);
+
+    PRINT 'Silver Layer ETL completed successfully for all 6 tables.';
+END;
+GO
