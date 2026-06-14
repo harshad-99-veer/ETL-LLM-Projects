@@ -1,0 +1,134 @@
+
+/********************************************************************
+* TABLE: silver.erp_cust_az12 
+* PURPOSE: Cleaned ERP Customer Demographics - Silver Layer
+* RULES: 1.Remove NAS prefix 2.Future DOB->NULL 3.Gender standardize 
+*        4.Deduplicate 5.FK check with crm_cust_info
+********************************************************************/
+
+-- 1. DROP + CREATE DDL
+IF OBJECT_ID('silver.erp_cust_az12', 'U') IS NOT NULL
+    DROP TABLE silver.erp_cust_az12;
+GO
+
+CREATE TABLE silver.erp_cust_az12 (
+    cid VARCHAR(20) PRIMARY KEY,              -- Cleaned Customer ID
+    bdate DATE NULL,                          -- Birth date
+    gen VARCHAR(10) NOT NULL DEFAULT 'n/a',   -- Male/Female/n/a
+    
+    -- Audit columns for lineage
+    dwh_load_date DATETIME NOT NULL DEFAULT GETDATE(),
+    dwh_source VARCHAR(50) NOT NULL DEFAULT 'erp_cust_az12',
+    dwh_hash_key VARBINARY(32) NULL           -- For SCD Type 1/2
+);
+GO
+
+CREATE NONCLUSTERED INDEX IX_silver_erp_cust_az12_cid ON silver.erp_cust_az12(cid);
+GO
+
+-- 2. DEBUG: CHECK DUPLICATES IN SOURCE BEFORE LOAD
+PRINT '--- STEP 0: Checking duplicates in Bronze ---'
+SELECT TOP 10
+    CASE WHEN cid LIKE 'NAS%' THEN STUFF(cid, 1, 3, '') ELSE cid END AS clean_cid,
+    COUNT(*) AS dup_count,
+    MIN(bdate) AS min_bdate,
+    MAX(bdate) AS max_bdate
+FROM dbo.erp_cust_az12
+WHERE cid IS NOT NULL
+GROUP BY CASE WHEN cid LIKE 'NAS%' THEN STUFF(cid, 1, 3, '') ELSE cid END
+HAVING COUNT(*) > 1
+ORDER BY dup_count DESC;
+GO
+
+-- 3. ETL: CLEAN + DEDUP + LOAD USING MERGE
+PRINT '--- STEP 1: Loading Silver Layer ---'
+
+;WITH cleaned_data AS (
+    SELECT 
+        -- 3.1 Clean CID: Remove NAS prefix
+        CASE 
+            WHEN cid LIKE 'NAS%' THEN STUFF(cid, 1, 3, '')
+            ELSE cid
+        END AS clean_cid,
+        
+        -- 3.2 Clean BDate: Future dates -> NULL
+        CASE 
+            WHEN bdate > CAST(GETDATE() AS DATE) THEN NULL 
+            ELSE CAST(bdate AS DATE)
+        END AS clean_bdate,
+        
+        -- 3.3 Clean Gender: Standardize
+        CASE 
+            WHEN UPPER(LTRIM(RTRIM(gen))) IN ('F', 'FEMALE') THEN 'Female'
+            WHEN UPPER(LTRIM(RTRIM(gen))) IN ('M', 'MALE') THEN 'Male'
+            ELSE 'n/a'
+        END AS clean_gen,
+        
+        -- 3.4 Hash for change detection
+        HASHBYTES('SHA2_256', 
+            CONCAT(
+                CASE WHEN cid LIKE 'NAS%' THEN STUFF(cid, 1, 3, '') ELSE cid END, '|',
+                ISNULL(CONVERT(VARCHAR(10), bdate, 120), 'NULL'), '|',
+                UPPER(LTRIM(RTRIM(gen)))
+            )
+        ) AS hash_key,
+        
+        -- 3.5 Deduplicate: Keep latest. Tie-breaker on gen if bdate same
+        ROW_NUMBER() OVER(
+            PARTITION BY CASE WHEN cid LIKE 'NAS%' THEN STUFF(cid, 1, 3, '') ELSE cid END 
+            ORDER BY 
+                CASE WHEN bdate IS NULL THEN 1 ELSE 0 END,  -- NULLs last for SQL Server
+                bdate DESC,
+                gen DESC  -- Tie-breaker to ensure only 1 row gets rn=1
+        ) AS rn
+        
+    FROM dbo.erp_cust_az12
+    WHERE cid IS NOT NULL
+)
+-- 4. MERGE: Handles INSERT + UPDATE. No PK violation on rerun
+MERGE silver.erp_cust_az12 AS target
+USING (
+    SELECT clean_cid, clean_bdate, clean_gen, hash_key
+    FROM cleaned_data 
+    WHERE rn = 1
+    -- FK check: Only load customers present in CRM master
+    AND clean_cid IN (
+        SELECT DISTINCT cst_key 
+        FROM silver.crm_cust_info 
+        WHERE cst_key IS NOT NULL
+    )
+) AS source
+ON target.cid = source.clean_cid
+
+WHEN MATCHED AND target.dwh_hash_key <> source.hash_key THEN
+    UPDATE SET 
+        bdate = source.clean_bdate,
+        gen = source.clean_gen,
+        dwh_load_date = GETDATE(),
+        dwh_hash_key = source.hash_key
+
+WHEN NOT MATCHED BY TARGET THEN
+    INSERT (cid, bdate, gen, dwh_load_date, dwh_source, dwh_hash_key)
+    VALUES (source.clean_cid, source.clean_bdate, source.clean_gen, GETDATE(), 'erp_cust_az12', source.hash_key);
+GO
+
+-- 5. DATA QUALITY CHECKS AFTER LOAD
+PRINT '--- STEP 2: Data Quality Report ---'
+SELECT 'Total Rows Loaded' AS check_type, COUNT(*) AS cnt FROM silver.erp_cust_az12
+UNION ALL
+SELECT 'NULL Birth Dates', COUNT(*) FROM silver.erp_cust_az12 WHERE bdate IS NULL
+UNION ALL
+SELECT 'Future Birth Dates', COUNT(*) FROM silver.erp_cust_az12 WHERE bdate > GETDATE()
+UNION ALL
+SELECT 'Invalid Gender', COUNT(*) FROM silver.erp_cust_az12 WHERE gen NOT IN ('Male','Female','n/a')
+UNION ALL
+SELECT 'FK Missing in CRM', COUNT(*) 
+FROM silver.erp_cust_az12 s
+LEFT JOIN silver.crm_cust_info c ON s.cid = c.cst_key
+WHERE c.cst_key IS NULL;
+GO
+
+-- 6. SAMPLE OUTPUT
+PRINT '--- STEP 3: Sample 10 Rows ---'
+SELECT TOP 10 * FROM silver.erp_cust_az12 ORDER BY dwh_load_date DESC;
+GO
